@@ -36,16 +36,29 @@ export default class AthenaDriver
     },
   ];
 
-  private schema: { [schema: string]: { [table: string]: { columnName: string, dataType: string, isNullable: boolean }[] } } = {};
+  private schema: { 
+    [catalog: string]: { 
+      [schema: string]: { 
+        [table: string]: { 
+          columnName: string, 
+          dataType: string, 
+          isNullable: boolean 
+        }[] 
+      } 
+    } 
+  } = {};
   private schemaLoaded: Promise<void> | null = null;
 
   private staticCompletions: { [w: string]: NSDatabase.IStaticCompletion } | null = null;
   private staticCompletionLoaded: Promise<void> | null = null;
+  private functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
 
   private async loadInformationSchema() {
     try {
+      this.log.info('About to load schema using information schema query');
       const query = `
         SELECT 
+          table_catalog,
           table_schema,
           table_name,
           column_name,
@@ -56,49 +69,72 @@ export default class AthenaDriver
         WHERE table_schema NOT IN ('information_schema')
       `;
       
-      const results = await this.singleQuery(query, {});
-      this.schema = results[0].results.reduce((acc, row) => {
-        const schema = row.table_schema;
-        const table = row.table_name;
-        if (!acc[schema]) acc[schema] = {};
-        if (!acc[schema][table]) acc[schema][table] = [];
-        acc[schema][table].push({
-          columnName: row.column_name,
-          dataType: row.data_type,
-          isNullable: row.is_nullable === 'YES'
+      const result = await this.singleQuery(query, {});
+      let columnCount = 0;
+
+      let schema = {}
+      result.results.forEach(row => {
+        if (!schema[row['table_catalog']]) schema[row['table_catalog']] = {};
+        if (!schema[row['table_catalog']][row['table_schema']]) schema[row['table_catalog']][row['table_schema']] = {};
+        if (!schema[row['table_catalog']][row['table_schema']][row['table_name']]) schema[row['table_catalog']][row['table_schema']][row['table_name']] = [];
+        
+        schema[row['table_catalog']][row['table_schema']][row['table_name']].push({
+          columnName: row['column_name'],
+          dataType: row['data_type'],
+          isNullable: row['is_nullable'] === 'YES'
         });
-        return acc;
-      }, {});
+        columnCount++;
+
+      });
+      this.schema = schema;
+      this.log.info({ 
+        msg: 'Schema loaded using information schema',
+        catalogs: Object.keys(this.schema),
+        totalColumns: columnCount
+      });
     } catch (error) {
-      this.log.warn('Failed to load schema information:', error);
+      this.log.error('Failed to load schema information:', {error: error});
     }
   }
 
   private async loadStaticCompletions() {
-    const result = await this.singleQuery('SHOW FUNCTIONS', {});
-    
-    const functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
-    
-    // Process function results
-    result.results.forEach((row: { 
-      functionName: string;
-      argumentTypes: string;
-      returnType: string;
-      description: string;
-      functionType: string;
-      isDeterministic: boolean;
+
+    try {
+      this.log.info('About to load athena functions');
+      const result = await this.singleQuery('SHOW FUNCTIONS', {});
+      result.results.forEach((row: { 
+        functionName: string;
+        argumentTypes: string;
+        returnType: string;
+        description: string;
+        functionType: string;
+        isDeterministic: boolean;
     }) => {
-      if (!row.functionName) return;
-      
-      functionDetails[row.functionName] = {
-        label: row.functionName,
-        detail: `${row.functionName}(${row.argumentTypes}) → ${row.returnType}`,
+      let functionName = row['Function']
+      let argumentTypes = row['Argument Types']
+      let returnType = row['Return Type']
+      let description = row['Description']
+      let functionType = row['Function Type']
+      let isDeterministic = row['Deterministic']
+
+      if (!functionName) return;
+      this.functionDetails[functionName] = {
+        label: functionName,
+        detail: `${functionName}(${argumentTypes}) → ${returnType}`,
         documentation: { 
           kind: 'markdown',
-          value: row.description + `\n\n**Type:** ${row.functionType}\n**Deterministic:** ${row.isDeterministic}`
+          value: description + `\n\n**Type:** ${functionType}\n**Deterministic:** ${isDeterministic}`
         }
-      };
-    });
+        };
+      });
+      this.log.info({
+        msg: 'Athena function details loaded',
+        totalFunctions: Object.keys(this.functionDetails).length,
+        functionDetails: this.functionDetails
+      });
+    } catch (error) {
+      this.log.error('Failed to load athena functions:', {error: error});
+    }
 
     // Add SQL keywords (these aren't included in SHOW FUNCTIONS)
     const keywords: { [w: string]: NSDatabase.IStaticCompletion } = {
@@ -114,7 +150,7 @@ export default class AthenaDriver
       'CROSS JOIN UNNEST': { label: 'CROSS JOIN UNNEST', detail: 'CROSS JOIN UNNEST operator', documentation: { kind: 'markdown', value: 'Join with expanded array' } },  
     };
 
-    this.staticCompletions = { ...functionDetails, ...keywords };
+    this.staticCompletions = { ...this.functionDetails, ...keywords };
   }
 
   public async open() {
@@ -409,90 +445,42 @@ export default class AthenaDriver
     parent,
     item,
   }: Arg0<IConnectionDriver["getChildrenForItem"]>) {
-    const db = await this.connection;
+    if (this.schemaLoaded) {
+      await this.schemaLoaded;
+    }
 
     switch (item.childType) {
       case ContextValue.SCHEMA:
-        const catalogs = await db.listDataCatalogs();
-
-        return catalogs.DataCatalogsSummary.map((catalog) => ({
+        // Get catalogs (top level)
+        const catalogNames = Object.keys(this.schema);
+        return catalogNames.map((catalogName) => ({
           database: "",
-          label: catalog.CatalogName,
+          label: catalogName,
           type: item.childType,
-          schema: catalog.CatalogName,
+          schema: catalogName,
           childType: ContextValue.DATABASE,
         }));
+
       case ContextValue.DATABASE:
-        let databaseList = [];
-        let firstBatch: boolean = true;
-        let nextToken: string | null = null;
-
-        while (firstBatch == true || nextToken !== null) {
-          firstBatch = false;
-          let listDbRequest = {
-            CatalogName: parent.schema,
-          };
-          if (nextToken !== null) {
-            Object.assign(listDbRequest, {
-              NextToken: nextToken,
-            });
-          }
-          const catalog = await db.listDatabases(listDbRequest);
-          nextToken = "NextToken" in catalog ? catalog.NextToken : null;
-
-          databaseList = databaseList.concat(
-            catalog.DatabaseList.map((database) => ({
-              database: database.Name,
-              label: database.Name,
-              type: item.childType,
-              schema: parent.schema,
-              childType: ContextValue.TABLE,
-            }))
-          );
-        }
-        return databaseList;
-      case ContextValue.TABLE:
-        const tables = await this.rawQuery(
-          `SHOW TABLES IN \`${parent.database}\``
-        );
-        const views = await this.rawQuery(`SHOW VIEWS IN "${parent.database}"`);
-
-        const tableResults = await this.getQueryResults(
-          tables.QueryExecution?.QueryExecutionId || ""
-        );
-        const viewResults = await this.getQueryResults(
-          views.QueryExecution?.QueryExecutionId || ""
-        );
-
-        const tableRows = tableResults?.[0]?.ResultSet?.Rows || [];
-        const viewRows = viewResults?.[0]?.ResultSet?.Rows || [];
-
-        const viewsSet = new Set(
-          viewRows.map((row) => row.Data[0].VarCharValue)
-        );
-
-        return tableRows
-          .filter((row) => !viewsSet.has(row.Data[0].VarCharValue))
-          .map((row) => ({
-            database: parent.database,
-            label: row.Data[0].VarCharValue,
-            type: item.childType,
-            schema: parent.schema,
-            childType: ContextValue.COLUMN,
-          }));
-      case ContextValue.VIEW:
-        const views2 = await this.rawQuery(
-          `SHOW VIEWS IN "${parent.database}"`
-        );
-        const viewResults2 = await this.getQueryResults(
-          views2.QueryExecution?.QueryExecutionId || ""
-        );
-
-        return viewResults2[0].ResultSet.Rows.map((row) => ({
-          database: parent.database,
-          label: row.Data[0].VarCharValue,
+        // Get schemas within the catalog
+        const schemas = this.schema[parent.schema] || {};
+        return Object.keys(schemas).map(schemaName => ({
+          database: schemaName,
+          label: schemaName,
           type: item.childType,
-          schema: parent.schema,
+          schema: parent.schema, // catalog
+          childType: ContextValue.TABLE,
+        }));
+
+      case ContextValue.TABLE:
+      case ContextValue.VIEW:
+        // Get tables within the catalog and schema
+        const tables = this.schema[parent.schema]?.[parent.database] || {};
+        return Object.keys(tables).map(tableName => ({
+          database: parent.database, // schema
+          label: tableName,
+          type: item.childType,
+          schema: parent.schema, // catalog
           childType: ContextValue.COLUMN,
         }));
     }
@@ -517,45 +505,68 @@ export default class AthenaDriver
       case ContextValue.VIEW:
         const matchingTables: NSDatabase.SearchableItem[] = [];
         
-        for (const [schemaName, tables] of Object.entries(this.schema)) {
-          for (const tableName of Object.keys(tables)) {
-            if (!search || tableName.toLowerCase().includes(search.toLowerCase())) {
-              matchingTables.push({
-                database: schemaName,
-                label: tableName,
-                type: itemType,
-                schema: schemaName,
-                childType: ContextValue.COLUMN,
-              });
-            }
-          }
-        }
-        
-        return matchingTables.slice(0, 10); // Limit results to 10 items
-      case ContextValue.COLUMN:
-        const matchingColumns: NSDatabase.SearchableItem[] = [];
-        
-        for (const [schemaName, tables] of Object.entries(this.schema)) {
-          for (const [tableName, columns] of Object.entries(tables)) {
-            for (const column of columns) {
-              if (!search || column.columnName.toLowerCase().includes(search.toLowerCase())) {
-                matchingColumns.push({
+        for (const [catalogName, schemas] of Object.entries(this.schema)) {
+          for (const [schemaName, tables] of Object.entries(schemas)) {
+            for (const tableName of Object.keys(tables)) {
+              if (!search || tableName.toLowerCase().includes(search.toLowerCase())) {
+                matchingTables.push({
                   database: schemaName,
-                  label: column.columnName,
-                  type: ContextValue.COLUMN,
-                  dataType: column.dataType,
-                  schema: schemaName,
-                  childType: ContextValue.NO_CHILD,
-                  isNullable: column.isNullable,
-                  iconName: "column",
-                  table: tableName,
+                  label: tableName,
+                  type: itemType,
+                  schema: catalogName,
+                  childType: ContextValue.COLUMN,
                 });
               }
             }
           }
         }
+
+        return matchingTables.slice(0, 10);
+
+      case ContextValue.COLUMN:
+        const matchingColumns: NSDatabase.SearchableItem[] = [];
         
-        return matchingColumns.slice(0, 10);
+        for (const [catalogName, schemas] of Object.entries(this.schema)) {
+          for (const [schemaName, tables] of Object.entries(schemas)) {
+            for (const [tableName, columns] of Object.entries(tables)) {
+              Object.values(columns).forEach(column => {
+                if (!search || column.columnName.toLowerCase().includes(search.toLowerCase())) {
+                  matchingColumns.push({
+                    database: schemaName,
+                    label: column.columnName,
+                    type: ContextValue.COLUMN,
+                    dataType: column.dataType,
+                    schema: catalogName,
+                    childType: ContextValue.NO_CHILD,
+                    isNullable: column.isNullable,
+                    iconName: "column",
+                    table: tableName,
+                  });
+                }
+              });
+            }
+          }
+        }
+        case ContextValue.FUNCTION:
+          // Wait for completions if they're still loading
+          if (this.staticCompletionLoaded) {
+            await this.staticCompletionLoaded;
+          }
+
+          const matchingFunctions = Object.entries(this.functionDetails)
+            .filter(([name]) => 
+              !search || name.toLowerCase().includes(search.toLowerCase()))
+            .map(([name, completion]) => ({
+              label: name,
+              type: ContextValue.FUNCTION,
+              schema: '',
+              database: '',
+              childType: ContextValue.NO_CHILD,
+              detail: completion.detail,
+            }))
+            .slice(0, 10);
+
+          return matchingFunctions;
     }
     return [];
   }
