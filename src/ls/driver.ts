@@ -494,6 +494,9 @@ export default class AthenaDriver
     return [];
   }
 
+  /**
+   * Use Athena's SHOW FUNCTIONS to get completions for SQL functions
+   */
   public async getStaticCompletions(): Promise<{ [w: string]: NSDatabase.IStaticCompletion }> {
     const queryExecution = await this.rawQuery('SHOW FUNCTIONS');
     const results = await this.getQueryResults(queryExecution.QueryExecution?.QueryExecutionId || '');
@@ -508,7 +511,8 @@ export default class AthenaDriver
         const functionName = row.Data[0].VarCharValue;
         const returnType = row.Data[1]?.VarCharValue || '';
         const argumentTypes = row.Data[2]?.VarCharValue || '';
-        // const functionType = row.Data[3]?.VarCharValue || '';
+        const functionType = row.Data[3]?.VarCharValue || '';
+        const isDeterministic = row.Data[4]?.VarCharValue || '';
         const description = row.Data[5]?.VarCharValue || '';
         
         functionDetails[functionName] = {
@@ -516,7 +520,7 @@ export default class AthenaDriver
           detail: `${functionName}(${argumentTypes}) → ${returnType}`,
           documentation: { 
             kind: 'markdown',
-            value: description
+            value: description + `\n\n**Type:** ${functionType}\n**Deterministic:** ${isDeterministic}`
           }
         };
       });
