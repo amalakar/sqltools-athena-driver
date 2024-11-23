@@ -2,7 +2,7 @@ import AbstractDriver from '@sqltools/base-driver';
 import { IConnectionDriver, MConnectionExplorer, NSDatabase, Arg0, ContextValue } from '@sqltools/types';
 import queries from './queries';
 import { v4 as generateId } from 'uuid';
-import { Athena, AWSError, Credentials, SharedIniFileCredentials } from 'aws-sdk';
+import { Athena, AWSError, Credentials, SsoCredentials } from 'aws-sdk';
 import { PromiseResult } from 'aws-sdk/lib/request';
 import { GetQueryResultsInput, GetQueryResultsOutput } from 'aws-sdk/clients/athena';
 
@@ -35,15 +35,21 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
       return this.connection;
     }
 
-    if (this.credentials.connectionMethod !== 'Profile')
+    if (this.credentials.connectionMethod !== 'Profile') {
       var credentials = new Credentials({
         accessKeyId: this.credentials.accessKeyId,
         secretAccessKey: this.credentials.secretAccessKey,
         sessionToken: this.credentials.sessionToken,
       });
-    else
-      var credentials = new SharedIniFileCredentials({ profile: this.credentials.profile });
-
+    } else {
+      try {
+        process.env.AWS_SDK_LOAD_CONFIG = '1';
+        var credentials = new SsoCredentials({ profile: this.credentials.profile });
+      } catch (error) {
+        console.error('Failed to create SSO credentials:', error);
+        throw error;
+      }
+    }
     this.connection = Promise.resolve(new Athena({
       credentials: credentials,
       region: this.credentials.region || 'us-east-1',
@@ -67,7 +73,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
 
   private sleep = (time: number) => new Promise((resolve) => setTimeout(() => resolve(true), time));
 
-  private rawQuery = async (query: string) => {
+  private async rawQuery(query: string): Promise<PromiseResult<Athena.GetQueryExecutionOutput, AWSError>> {
     const db = await this.open();
 
     const queryExecution = await db.startQueryExecution({
@@ -202,8 +208,8 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
         }).promise();
 
         return [
-          ...tableMetadata.TableMetadata.Columns,
-          ...tableMetadata.TableMetadata.PartitionKeys,
+          ...(tableMetadata.TableMetadata.Columns || []),
+          ...(tableMetadata.TableMetadata.PartitionKeys || []),
         ].map(column => ({
           label: column.Name,
           type: ContextValue.COLUMN,
@@ -241,6 +247,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
           childType: ContextValue.DATABASE,
         }));
       case ContextValue.DATABASE:
+
         let databaseList = [];          
         let firstBatch:boolean = true;
         let nextToken:string|null = null;
@@ -271,10 +278,17 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
       case ContextValue.TABLE:
         const tables = await this.rawQuery(`SHOW TABLES IN \`${parent.database}\``);
         const views = await this.rawQuery(`SHOW VIEWS IN "${parent.database}"`);
+  
+        const tableResults = await this.getQueryResults(tables.QueryExecution?.QueryExecutionId || '');
+        const viewResults = await this.getQueryResults(views.QueryExecution?.QueryExecutionId || '');
+        
+        const tableRows = tableResults?.[0]?.ResultSet?.Rows || [];
+        const viewRows = viewResults?.[0]?.ResultSet?.Rows || [];
+        
+        const viewsSet = new Set(viewRows.map((row) => row.Data[0].VarCharValue));
 
-        const viewsSet = new Set(views[0].ResultSet.Rows.map((row) => row.Data[0].VarCharValue));
-
-        return tables[0].ResultSet.Rows
+        
+        return tableRows
           .filter((row) => !viewsSet.has(row.Data[0].VarCharValue))
           .map((row) => ({
             database: parent.database,
@@ -285,8 +299,9 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
           }));
       case ContextValue.VIEW:
         const views2 = await this.rawQuery(`SHOW VIEWS IN "${parent.database}"`);
+        const viewResults2 = await this.getQueryResults(views2.QueryExecution?.QueryExecutionId || '');
         
-        return views2[0].ResultSet.Rows.map((row) => ({
+        return viewResults2[0].ResultSet.Rows.map((row) => ({
           database: parent.database,
           label: row.Data[0].VarCharValue,
           type: item.childType,
