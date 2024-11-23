@@ -2,11 +2,13 @@ import AbstractDriver from '@sqltools/base-driver';
 import { IConnectionDriver, MConnectionExplorer, NSDatabase, Arg0, ContextValue } from '@sqltools/types';
 import queries from './queries';
 import { v4 as generateId } from 'uuid';
-import { Athena, AWSError, Credentials, SsoCredentials } from 'aws-sdk';
-import { PromiseResult } from 'aws-sdk/lib/request';
-import { GetQueryResultsInput, GetQueryResultsOutput } from 'aws-sdk/clients/athena';
+import { Athena } from '@aws-sdk/client-athena';
+import { GetQueryResultsInput, GetQueryResultsOutput } from '@aws-sdk/client-athena';
+import { AwsCredentialIdentity } from '@aws-sdk/types';
+import { fromIni } from '@aws-sdk/credential-provider-ini';
 
-export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.ClientConfiguration> implements IConnectionDriver {
+
+export default class AthenaDriver extends AbstractDriver<Athena, any> implements IConnectionDriver {
 
   queries = queries
 
@@ -20,33 +22,23 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
     // version: 'x.x.x',
   }];
 
-  /** if you need to require your lib in runtime and then
-   * use `this.lib.methodName()` anywhere and vscode will take care of the dependencies
-   * to be installed on a cache folder
-   **/
-  // private get lib() {
-  //   return this.requireDep('node-packge-name') as DriverLib;
-  // }
-  
-
-
   public async open() {
     if (this.connection) {
       return this.connection;
     }
 
+    let credentials: AwsCredentialIdentity;
     if (this.credentials.connectionMethod !== 'Profile') {
-      var credentials = new Credentials({
+      credentials = {
         accessKeyId: this.credentials.accessKeyId,
         secretAccessKey: this.credentials.secretAccessKey,
         sessionToken: this.credentials.sessionToken,
-      });
+      };
     } else {
       try {
-        process.env.AWS_SDK_LOAD_CONFIG = '1';
-        var credentials = new SsoCredentials({ profile: this.credentials.profile });
+        credentials = await (await fromIni({ profile: this.credentials.profile }))();
       } catch (error) {
-        console.error('Failed to create SSO credentials:', error);
+        console.error('Failed to use credentials for profile', this.credentials.profile, error);
         throw error;
       }
     }
@@ -73,7 +65,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
 
   private sleep = (time: number) => new Promise((resolve) => setTimeout(() => resolve(true), time));
 
-  private async rawQuery(query: string): Promise<PromiseResult<Athena.GetQueryExecutionOutput, AWSError>> {
+  private async rawQuery(query: string) {
     const db = await this.open();
 
     const queryExecution = await db.startQueryExecution({
@@ -82,7 +74,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
       ResultConfiguration: {
         OutputLocation: this.credentials.outputLocation
       }
-    }).promise();
+    });
 
     const endStatus = new Set(['FAILED', 'SUCCEEDED', 'CANCELLED']);
 
@@ -91,7 +83,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
     do {
         queryCheckExecution = await db.getQueryExecution({ 
             QueryExecutionId: queryExecution.QueryExecutionId,
-        }).promise();
+        });
         
         console.log(
             `Query ${queryExecution.QueryExecutionId} ` +
@@ -113,8 +105,8 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
   private async getQueryResults(
     queryExecutionId: string
   ) {
-    const results: PromiseResult<GetQueryResultsOutput, AWSError>[] = [];
-    let result: PromiseResult<GetQueryResultsOutput, AWSError>;
+    const results: GetQueryResultsOutput[] = [];
+    let result: GetQueryResultsOutput;
     let nextToken: string | null = null;
     let db = await this.open();
 
@@ -126,7 +118,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
         payload.NextToken = nextToken;
         await this.sleep(200);
       }
-      result = await db.getQueryResults(payload).promise();
+      result = await db.getQueryResults(payload);
       nextToken = result?.NextToken;
       results.push(result);
     } while (nextToken);
@@ -205,7 +197,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
           CatalogName: item.schema,
           DatabaseName: item.database,
           TableName: item.label
-        }).promise();
+        });
 
         return [
           ...(tableMetadata.TableMetadata.Columns || []),
@@ -237,7 +229,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
     
     switch (item.childType) {
       case ContextValue.SCHEMA:
-        const catalogs = await db.listDataCatalogs().promise();
+        const catalogs = await db.listDataCatalogs();
 
         return catalogs.DataCatalogsSummary.map((catalog) => ({
           database: '',
@@ -262,7 +254,7 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
               NextToken: nextToken,
             });
           }
-          const catalog = await db.listDatabases(listDbRequest).promise();
+          const catalog = await db.listDatabases(listDbRequest);
           nextToken = 'NextToken' in catalog ? catalog.NextToken : null;
 
           databaseList = databaseList.concat(
