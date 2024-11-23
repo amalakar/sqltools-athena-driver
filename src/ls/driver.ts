@@ -52,7 +52,7 @@ export default class AthenaDriver
       try {
         credentials = await fromIni({ profile: this.credentials.profile })();
       } catch (error) {
-        console.error(
+        this.log.error(
           "Failed to use credentials for profile",
           this.credentials.profile,
           error
@@ -119,7 +119,7 @@ export default class AthenaDriver
         QueryExecutionId: queryExecution.QueryExecutionId,
       });
 
-      console.log(
+      this.log.info(
         `Query ${queryExecution.QueryExecutionId} ` +
           `is ${queryCheckExecution.QueryExecution.Status.State} ` +
           `${queryCheckExecution.QueryExecution.Statistics?.TotalExecutionTimeInMillis} ms elapsed. ` +
@@ -494,10 +494,50 @@ export default class AthenaDriver
     return [];
   }
 
-  public getStaticCompletions: IConnectionDriver["getStaticCompletions"] =
-    async () => {
-      return {};
+  public async getStaticCompletions(): Promise<{ [w: string]: NSDatabase.IStaticCompletion }> {
+    const queryExecution = await this.rawQuery('SHOW FUNCTIONS');
+    const results = await this.getQueryResults(queryExecution.QueryExecution?.QueryExecutionId || '');
+    
+    const functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
+    
+    // Process function results
+    results.forEach(result => {
+      result.ResultSet.Rows.forEach(row => {
+        if (!row.Data?.[0]?.VarCharValue) return;
+        
+        const functionName = row.Data[0].VarCharValue;
+        const returnType = row.Data[1]?.VarCharValue || '';
+        const argumentTypes = row.Data[2]?.VarCharValue || '';
+        // const functionType = row.Data[3]?.VarCharValue || '';
+        const description = row.Data[5]?.VarCharValue || '';
+        
+        functionDetails[functionName] = {
+          label: functionName,
+          detail: `${functionName}(${argumentTypes}) → ${returnType}`,
+          documentation: { 
+            kind: 'markdown',
+            value: description
+          }
+        };
+      });
+    });
+
+    // Add SQL keywords (these aren't included in SHOW FUNCTIONS)
+    const keywords: { [w: string]: NSDatabase.IStaticCompletion } = {
+      'SELECT': { label: 'SELECT', detail: 'SELECT keyword', documentation: { kind: 'markdown', value: 'Start a SELECT query' } },
+      'FROM': { label: 'FROM', detail: 'FROM keyword', documentation: { kind: 'markdown', value: 'Specify the table to query from' } },
+      'WHERE': { label: 'WHERE', detail: 'WHERE clause', documentation: { kind: 'markdown', value: 'Filter results' } },
+      'GROUP BY': { label: 'GROUP BY', detail: 'GROUP BY clause', documentation: { kind: 'markdown', value: 'Group results' } },
+      'ORDER BY': { label: 'ORDER BY', detail: 'ORDER BY clause', documentation: { kind: 'markdown', value: 'Sort results' } },
+      'HAVING': { label: 'HAVING', detail: 'HAVING clause', documentation: { kind: 'markdown', value: 'Filter grouped results' } },
+      'LIMIT': { label: 'LIMIT', detail: 'LIMIT clause', documentation: { kind: 'markdown', value: 'Limit number of results' } },
+      'WITH': { label: 'WITH', detail: 'WITH clause', documentation: { kind: 'markdown', value: 'Define named subqueries' } },
+      'UNNEST': { label: 'UNNEST', detail: 'UNNEST operator', documentation: { kind: 'markdown', value: 'Expands an array into a relation' } },
+      'CROSS JOIN UNNEST': { label: 'CROSS JOIN UNNEST', detail: 'CROSS JOIN UNNEST operator', documentation: { kind: 'markdown', value: 'Join with expanded array' } },  
     };
+
+    return { ...functionDetails, ...keywords };
+  }
 
   public async describeTable(
     table: NSDatabase.ITable,
