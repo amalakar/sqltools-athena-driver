@@ -36,6 +36,87 @@ export default class AthenaDriver
     },
   ];
 
+  private schema: { [schema: string]: { [table: string]: { columnName: string, dataType: string, isNullable: boolean }[] } } = {};
+  private schemaLoaded: Promise<void> | null = null;
+
+  private staticCompletions: { [w: string]: NSDatabase.IStaticCompletion } | null = null;
+  private staticCompletionLoaded: Promise<void> | null = null;
+
+  private async loadInformationSchema() {
+    try {
+      const query = `
+        SELECT 
+          table_schema,
+          table_name,
+          column_name,
+          data_type,
+          comment,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('information_schema')
+      `;
+      
+      const results = await this.singleQuery(query, {});
+      this.schema = results[0].results.reduce((acc, row) => {
+        const schema = row.table_schema;
+        const table = row.table_name;
+        if (!acc[schema]) acc[schema] = {};
+        if (!acc[schema][table]) acc[schema][table] = [];
+        acc[schema][table].push({
+          columnName: row.column_name,
+          dataType: row.data_type,
+          isNullable: row.is_nullable === 'YES'
+        });
+        return acc;
+      }, {});
+    } catch (error) {
+      this.log.warn('Failed to load schema information:', error);
+    }
+  }
+
+  private async loadStaticCompletions() {
+    const result = await this.singleQuery('SHOW FUNCTIONS', {});
+    
+    const functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
+    
+    // Process function results
+    result.results.forEach((row: { 
+      functionName: string;
+      argumentTypes: string;
+      returnType: string;
+      description: string;
+      functionType: string;
+      isDeterministic: boolean;
+    }) => {
+      if (!row.functionName) return;
+      
+      functionDetails[row.functionName] = {
+        label: row.functionName,
+        detail: `${row.functionName}(${row.argumentTypes}) → ${row.returnType}`,
+        documentation: { 
+          kind: 'markdown',
+          value: row.description + `\n\n**Type:** ${row.functionType}\n**Deterministic:** ${row.isDeterministic}`
+        }
+      };
+    });
+
+    // Add SQL keywords (these aren't included in SHOW FUNCTIONS)
+    const keywords: { [w: string]: NSDatabase.IStaticCompletion } = {
+      'SELECT': { label: 'SELECT', detail: 'SELECT keyword', documentation: { kind: 'markdown', value: 'Start a SELECT query' } },
+      'FROM': { label: 'FROM', detail: 'FROM keyword', documentation: { kind: 'markdown', value: 'Specify the table to query from' } },
+      'WHERE': { label: 'WHERE', detail: 'WHERE clause', documentation: { kind: 'markdown', value: 'Filter results' } },
+      'GROUP BY': { label: 'GROUP BY', detail: 'GROUP BY clause', documentation: { kind: 'markdown', value: 'Group results' } },
+      'ORDER BY': { label: 'ORDER BY', detail: 'ORDER BY clause', documentation: { kind: 'markdown', value: 'Sort results' } },
+      'HAVING': { label: 'HAVING', detail: 'HAVING clause', documentation: { kind: 'markdown', value: 'Filter grouped results' } },
+      'LIMIT': { label: 'LIMIT', detail: 'LIMIT clause', documentation: { kind: 'markdown', value: 'Limit number of results' } },
+      'WITH': { label: 'WITH', detail: 'WITH clause', documentation: { kind: 'markdown', value: 'Define named subqueries' } },
+      'UNNEST': { label: 'UNNEST', detail: 'UNNEST operator', documentation: { kind: 'markdown', value: 'Expands an array into a relation' } },
+      'CROSS JOIN UNNEST': { label: 'CROSS JOIN UNNEST', detail: 'CROSS JOIN UNNEST operator', documentation: { kind: 'markdown', value: 'Join with expanded array' } },  
+    };
+
+    this.staticCompletions = { ...functionDetails, ...keywords };
+  }
+
   public async open() {
     if (this.connection) {
       return this.connection;
@@ -60,6 +141,7 @@ export default class AthenaDriver
         throw error;
       }
     }
+    
     this.connection = Promise.resolve(
       new Athena({
         credentials: credentials,
@@ -67,8 +149,21 @@ export default class AthenaDriver
       })
     );
 
+    // Start both schema and completions loading asynchronously
+    this.schemaLoaded = this.loadInformationSchema().finally(() => {
+      this.schemaLoaded = null;
+    });
+
+    this.staticCompletionLoaded = this.loadStaticCompletions().finally(() => {
+      this.staticCompletionLoaded = null;
+    });
+
     return this.connection;
   }
+
+  /**
+   * Format bytes to a human readable string
+   */
   private formatBytes = (bytes: number, decimals: number = 2) => {
     if (!+bytes) return "0 Bytes";
 
@@ -214,6 +309,14 @@ export default class AthenaDriver
     ];
 
     return response;
+  };
+
+  public singleQuery: (typeof AbstractDriver)["prototype"]["singleQuery"] = async (
+    query: string | String,
+    opt: IQueryOptions = {}
+  ): Promise<NSDatabase.IResult> => {
+    const results = await this.query(query.toString(), opt);
+    return results[0];
   };
 
   /** if you need a different way to test your connection, you can set it here.
@@ -404,92 +507,55 @@ export default class AthenaDriver
     search: string,
     _extraParams: any = {}
   ): Promise<NSDatabase.SearchableItem[]> {
+    // Wait for schema if it's still loading
+    if (this.schemaLoaded) {
+      await this.schemaLoaded;
+    }
+
     switch (itemType) {
       case ContextValue.TABLE:
       case ContextValue.VIEW:
-        let j = 0;
-        return [
-          {
-            database: "fakedb",
-            label: `${search || "table"}${j++}`,
-            type: itemType,
-            schema: "fakeschema",
-            childType: ContextValue.COLUMN,
-          },
-          {
-            database: "fakedb",
-            label: `${search || "table"}${j++}`,
-            type: itemType,
-            schema: "fakeschema",
-            childType: ContextValue.COLUMN,
-          },
-          {
-            database: "fakedb",
-            label: `${search || "table"}${j++}`,
-            type: itemType,
-            schema: "fakeschema",
-            childType: ContextValue.COLUMN,
-          },
-        ];
+        const matchingTables: NSDatabase.SearchableItem[] = [];
+        
+        for (const [schemaName, tables] of Object.entries(this.schema)) {
+          for (const tableName of Object.keys(tables)) {
+            if (!search || tableName.toLowerCase().includes(search.toLowerCase())) {
+              matchingTables.push({
+                database: schemaName,
+                label: tableName,
+                type: itemType,
+                schema: schemaName,
+                childType: ContextValue.COLUMN,
+              });
+            }
+          }
+        }
+        
+        return matchingTables.slice(0, 10); // Limit results to 10 items
       case ContextValue.COLUMN:
-        let i = 0;
-        return [
-          {
-            database: "fakedb",
-            label: `${search || "porra"}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: "faketype",
-            schema: "fakeschema",
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: "column",
-            table: "fakeTable",
-          },
-          {
-            database: "fakedb",
-            label: `${search || "column"}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: "faketype",
-            schema: "fakeschema",
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: "column",
-            table: "fakeTable",
-          },
-          {
-            database: "fakedb",
-            label: `${search || "column"}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: "faketype",
-            schema: "fakeschema",
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: "column",
-            table: "fakeTable",
-          },
-          {
-            database: "fakedb",
-            label: `${search || "column"}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: "faketype",
-            schema: "fakeschema",
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: "column",
-            table: "fakeTable",
-          },
-          {
-            database: "fakedb",
-            label: `${search || "column"}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: "faketype",
-            schema: "fakeschema",
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: "column",
-            table: "fakeTable",
-          },
-        ];
+        const matchingColumns: NSDatabase.SearchableItem[] = [];
+        
+        for (const [schemaName, tables] of Object.entries(this.schema)) {
+          for (const [tableName, columns] of Object.entries(tables)) {
+            for (const column of columns) {
+              if (!search || column.columnName.toLowerCase().includes(search.toLowerCase())) {
+                matchingColumns.push({
+                  database: schemaName,
+                  label: column.columnName,
+                  type: ContextValue.COLUMN,
+                  dataType: column.dataType,
+                  schema: schemaName,
+                  childType: ContextValue.NO_CHILD,
+                  isNullable: column.isNullable,
+                  iconName: "column",
+                  table: tableName,
+                });
+              }
+            }
+          }
+        }
+        
+        return matchingColumns.slice(0, 10);
     }
     return [];
   }
@@ -498,49 +564,12 @@ export default class AthenaDriver
    * Use Athena's SHOW FUNCTIONS to get completions for SQL functions
    */
   public async getStaticCompletions(): Promise<{ [w: string]: NSDatabase.IStaticCompletion }> {
-    const queryExecution = await this.rawQuery('SHOW FUNCTIONS');
-    const results = await this.getQueryResults(queryExecution.QueryExecution?.QueryExecutionId || '');
+    // Wait for completions if they're still loading
+    if (this.staticCompletionLoaded) {
+      await this.staticCompletionLoaded;
+    }
     
-    const functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
-    
-    // Process function results
-    results.forEach(result => {
-      result.ResultSet.Rows.forEach(row => {
-        if (!row.Data?.[0]?.VarCharValue) return;
-        
-        const functionName = row.Data[0].VarCharValue;
-        const returnType = row.Data[1]?.VarCharValue || '';
-        const argumentTypes = row.Data[2]?.VarCharValue || '';
-        const functionType = row.Data[3]?.VarCharValue || '';
-        const isDeterministic = row.Data[4]?.VarCharValue || '';
-        const description = row.Data[5]?.VarCharValue || '';
-        
-        functionDetails[functionName] = {
-          label: functionName,
-          detail: `${functionName}(${argumentTypes}) → ${returnType}`,
-          documentation: { 
-            kind: 'markdown',
-            value: description + `\n\n**Type:** ${functionType}\n**Deterministic:** ${isDeterministic}`
-          }
-        };
-      });
-    });
-
-    // Add SQL keywords (these aren't included in SHOW FUNCTIONS)
-    const keywords: { [w: string]: NSDatabase.IStaticCompletion } = {
-      'SELECT': { label: 'SELECT', detail: 'SELECT keyword', documentation: { kind: 'markdown', value: 'Start a SELECT query' } },
-      'FROM': { label: 'FROM', detail: 'FROM keyword', documentation: { kind: 'markdown', value: 'Specify the table to query from' } },
-      'WHERE': { label: 'WHERE', detail: 'WHERE clause', documentation: { kind: 'markdown', value: 'Filter results' } },
-      'GROUP BY': { label: 'GROUP BY', detail: 'GROUP BY clause', documentation: { kind: 'markdown', value: 'Group results' } },
-      'ORDER BY': { label: 'ORDER BY', detail: 'ORDER BY clause', documentation: { kind: 'markdown', value: 'Sort results' } },
-      'HAVING': { label: 'HAVING', detail: 'HAVING clause', documentation: { kind: 'markdown', value: 'Filter grouped results' } },
-      'LIMIT': { label: 'LIMIT', detail: 'LIMIT clause', documentation: { kind: 'markdown', value: 'Limit number of results' } },
-      'WITH': { label: 'WITH', detail: 'WITH clause', documentation: { kind: 'markdown', value: 'Define named subqueries' } },
-      'UNNEST': { label: 'UNNEST', detail: 'UNNEST operator', documentation: { kind: 'markdown', value: 'Expands an array into a relation' } },
-      'CROSS JOIN UNNEST': { label: 'CROSS JOIN UNNEST', detail: 'CROSS JOIN UNNEST operator', documentation: { kind: 'markdown', value: 'Join with expanded array' } },  
-    };
-
-    return { ...functionDetails, ...keywords };
+    return this.staticCompletions || {};
   }
 
   public async describeTable(
