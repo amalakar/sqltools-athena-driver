@@ -5,6 +5,7 @@ import {
   NSDatabase,
   Arg0,
   ContextValue,
+  IQueryOptions,
 } from "@sqltools/types";
 import queries from "./queries";
 import { v4 as generateId } from "uuid";
@@ -15,6 +16,7 @@ import {
 } from "@aws-sdk/client-athena";
 import { AwsCredentialIdentity } from "@aws-sdk/types";
 import { fromIni } from "@aws-sdk/credential-provider-ini";
+import { GetQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
 
 export default class AthenaDriver
   extends AbstractDriver<Athena, any>
@@ -110,7 +112,7 @@ export default class AthenaDriver
 
     const endStatus = new Set(["FAILED", "SUCCEEDED", "CANCELLED"]);
 
-    let queryCheckExecution;
+    let queryCheckExecution: GetQueryExecutionCommandOutput;
 
     do {
       queryCheckExecution = await db.getQueryExecution({
@@ -138,6 +140,7 @@ export default class AthenaDriver
     return queryCheckExecution;
   }
 
+  
   private async getQueryResults(queryExecutionId: string) {
     const results: GetQueryResultsOutput[] = [];
     let result: GetQueryResultsOutput;
@@ -495,4 +498,90 @@ export default class AthenaDriver
     async () => {
       return {};
     };
+
+  public async describeTable(
+    table: NSDatabase.ITable,
+    opt?: IQueryOptions
+  ): Promise<NSDatabase.IResult[]> {
+    const db = await this.open();
+    
+    const tableMetadata = await db.getTableMetadata({
+      CatalogName: table.schema,
+      DatabaseName: table.database,
+      TableName: table.label,
+    });
+
+    const columns = [
+      ...(tableMetadata.TableMetadata.Columns || []),
+      ...(tableMetadata.TableMetadata.PartitionKeys || [])
+    ].map(col => ({
+      column_name: col.Name,
+      data_type: col.Type,
+      is_nullable: 'YES',
+      column_key: col.Name in (tableMetadata.TableMetadata.PartitionKeys || []) ? 'PARTITION KEY' : '',
+    }));
+
+    return [{
+      resultId: generateId(),
+      connId: this.getId(),
+      cols: ['column_name', 'data_type', 'is_nullable', 'column_key'],
+      messages: [{ message: `Described table ${table.label}`, date: new Date() }],
+      query: `DESCRIBE \`${table.database}\`.\`${table.label}\``,
+      results: columns,
+      requestId: opt?.requestId,
+    }];
+  }
+  
+  public async showRecords(
+    table: NSDatabase.ITable,
+    opt: IQueryOptions & { limit: number; page?: number }
+  ): Promise<NSDatabase.IResult[]> {
+    const offset = opt.page ? (opt.page - 1) * opt.limit : 0;
+    const query = `SELECT *
+      FROM "${table.database}"."${table.label}"
+      LIMIT ${opt.limit}
+      ${offset > 0 ? `OFFSET ${offset}` : ''}`;
+
+    const queryExecution = await this.rawQuery(query);
+    const results = await this.getQueryResults(
+      queryExecution.QueryExecution?.QueryExecutionId || ''
+    );
+
+    // Get column names from the first result's metadata
+    const columns = results[0].ResultSet.ResultSetMetadata.ColumnInfo.map(
+      (info) => info.Name
+    );
+
+    // Transform the results into the expected format
+    const resultSet = [];
+    results.forEach((result, i) => {
+      const rows = result.ResultSet.Rows;
+      if (i === 0) rows.shift(); // Skip header row in first result
+      rows.forEach(({ Data }) => {
+        resultSet.push(
+          Object.assign(
+            {},
+            ...Data.map((column, i) => ({ [columns[i]]: column.VarCharValue }))
+          )
+        );
+      });
+    });
+
+    return [{
+      resultId: generateId(),
+      connId: this.getId(),
+      cols: columns,
+      messages: [{
+        date: new Date(),
+        message: `Retrieved ${resultSet.length} records from ${table.label}. ${this.formatBytes(
+          queryExecution.QueryExecution?.Statistics?.DataScannedInBytes || 0
+        )} scanned`,
+      }],
+      results: resultSet,
+      query: query,
+      requestId: opt.requestId,
+      pageSize: opt.limit,
+      page: opt.page || 1,
+    }];
+  }
 }

@@ -26,7 +26,6 @@
     "driver"
   ],
   "activationEvents": [
-    "*",
     "onLanguage:sql",
     "onCommand:sqltools.*"
   ],
@@ -40,12 +39,13 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "build": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
+    "package": "vsce package",
+    "compile": "tsc -p ./",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "pretest": "npm run compile && npm run lint",
+    "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
     "@sqltools/base-driver": "^0.1.11",
