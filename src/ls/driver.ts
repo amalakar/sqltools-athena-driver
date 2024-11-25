@@ -223,8 +223,9 @@ export default class AthenaDriver
   };
 
   public async close() {
-
-
+    this.connection = null;
+    this.schema = {};
+    this.staticCompletions = null;
   }
 
   private sleep = (time: number) =>
