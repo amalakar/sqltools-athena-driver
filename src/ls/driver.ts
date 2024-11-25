@@ -9,7 +9,7 @@ import {
 } from "@sqltools/types";
 import queries from "./queries";
 import { v4 as generateId } from "uuid";
-import { Athena } from "@aws-sdk/client-athena";
+import { Athena, QueryExecutionState } from "@aws-sdk/client-athena";
 import {
   GetQueryResultsInput,
   GetQueryResultsOutput,
@@ -17,6 +17,7 @@ import {
 import { AwsCredentialIdentity } from "@aws-sdk/types";
 import { fromIni } from "@aws-sdk/credential-provider-ini";
 import { GetQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
+import { Diagnostic, DiagnosticSeverity, Range, Position } from "vscode-languageserver";
 
 export default class AthenaDriver
   extends AbstractDriver<Athena, any>
@@ -241,7 +242,11 @@ export default class AthenaDriver
       },
     });
 
-    const endStatus = new Set(["FAILED", "SUCCEEDED", "CANCELLED"]);
+    const endStatus = new Set<QueryExecutionState>([
+      QueryExecutionState.FAILED,
+      QueryExecutionState.SUCCEEDED,
+      QueryExecutionState.CANCELLED
+    ]);
 
     let queryCheckExecution: GetQueryExecutionCommandOutput;
 
@@ -258,19 +263,43 @@ export default class AthenaDriver
             queryCheckExecution.QueryExecution.Statistics?.DataScannedInBytes
           )} scanned`
       );
-
       await this.sleep(200);
     } while (!endStatus.has(queryCheckExecution.QueryExecution.Status.State));
 
-    if (queryCheckExecution.QueryExecution.Status.State === "FAILED") {
-      throw new Error(
-        queryCheckExecution.QueryExecution.Status.StateChangeReason
-      );
+    if (queryCheckExecution.QueryExecution.Status.State === QueryExecutionState.FAILED) {
+      const errorMessage = queryCheckExecution.QueryExecution.Status.StateChangeReason || '';
+      const diagnostics = this.parseError(errorMessage);
+      console.error('Parsed error diagnostics:', { "diagnostics": diagnostics });
+      throw new Error(errorMessage);
     }
 
     return queryCheckExecution;
   }
 
+  private parseError(errorMessage: string): Diagnostic[] {
+    const pattern = /line (\d+):(\d+)/;
+    const match = errorMessage.match(pattern);
+    
+    const ERROR_HIGHLIGHT_LENGTH = 10;  // Number of characters to highlight
+
+    if (match) {
+      const line = parseInt(match[1], 10) - 1;     // Convert to 0-based
+      const column = parseInt(match[2], 10) - 1;
+      
+      return [{
+        severity: DiagnosticSeverity.Error,
+        range: Range.create(
+          Position.create(line, column),
+          Position.create(line, column + ERROR_HIGHLIGHT_LENGTH)
+        ),
+        message: errorMessage,
+        source: 'Athena'
+      }];
+    }
+    
+    // Return empty array if no line:column found
+    return [];
+  }
   
   private async getQueryResults(queryExecutionId: string) {
     const results: GetQueryResultsOutput[] = [];
