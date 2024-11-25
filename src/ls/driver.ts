@@ -129,8 +129,7 @@ export default class AthenaDriver
       });
       this.log.info({
         msg: 'Athena function details loaded',
-        totalFunctions: Object.keys(this.functionDetails).length,
-        functionDetails: this.functionDetails
+        totalFunctions: Object.keys(this.functionDetails).length
       });
     } catch (error) {
       this.log.error('Failed to load athena functions:', {error: error});
