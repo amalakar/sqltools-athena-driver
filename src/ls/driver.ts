@@ -62,6 +62,8 @@ export default class AthenaDriver
     QueryExecutionState.CANCELLED
   ]);
 
+  private lastDiagnosticUri: string | null = null;  // Track last document with error
+
   private async loadInformationSchema() {
     try {
       this.log.info('About to load schema using information schema query');
@@ -297,10 +299,21 @@ export default class AthenaDriver
       
       const bestMatch = this.findBestMatchingDocument(query, sqlDocuments);
       if (bestMatch) {
-        server.server.sendDiagnostics({
-          uri: bestMatch.uri.toString(), // Convert Uri to string
-          diagnostics
+        const uri = bestMatch.uri.toString();
+        this.lastDiagnosticUri = uri;
+        
+        // Set up change listener if not already set
+        server.docManager.onDidChangeContent((change) => {
+          if (change.document.uri === this.lastDiagnosticUri) {
+            server.server.sendDiagnostics({
+              uri: this.lastDiagnosticUri,
+              diagnostics: []  // Clear diagnostics
+            });
+            this.lastDiagnosticUri = null;  // Reset tracked URI
+          }
         });
+
+        server.server.sendDiagnostics({ uri, diagnostics });
       }
     }
   }
