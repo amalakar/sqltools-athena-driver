@@ -9,7 +9,7 @@ import {
 } from "@sqltools/types";
 import queries from "./queries";
 import { v4 as generateId } from "uuid";
-import { Athena, QueryExecutionState } from "@aws-sdk/client-athena";
+import { Athena, QueryExecutionState, StartQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
 import {
   GetQueryResultsInput,
   GetQueryResultsOutput,
@@ -18,6 +18,9 @@ import { AwsCredentialIdentity } from "@aws-sdk/types";
 import { fromIni } from "@aws-sdk/credential-provider-ini";
 import { GetQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
 import { Diagnostic, DiagnosticSeverity, Range, Position } from "vscode-languageserver";
+import { ServerStorage } from './plugin';
+import { findBestMatch } from 'string-similarity';
+import { TextDocument } from "vscode";
 
 export default class AthenaDriver
   extends AbstractDriver<Athena, any>
@@ -53,6 +56,11 @@ export default class AthenaDriver
   private staticCompletions: { [w: string]: NSDatabase.IStaticCompletion } | null = null;
   private staticCompletionLoaded: Promise<void> | null = null;
   private functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
+  private endStatus = new Set<QueryExecutionState>([
+    QueryExecutionState.FAILED,
+    QueryExecutionState.SUCCEEDED,
+    QueryExecutionState.CANCELLED
+  ]);
 
   private async loadInformationSchema() {
     try {
@@ -233,20 +241,19 @@ export default class AthenaDriver
 
   private async rawQuery(query: string) {
     const db = await this.open();
-
-    const queryExecution = await db.startQueryExecution({
-      QueryString: query,
-      WorkGroup: this.credentials.workgroup,
-      ResultConfiguration: {
-        OutputLocation: this.credentials.outputLocation,
-      },
-    });
-
-    const endStatus = new Set<QueryExecutionState>([
-      QueryExecutionState.FAILED,
-      QueryExecutionState.SUCCEEDED,
-      QueryExecutionState.CANCELLED
-    ]);
+    let queryExecution: StartQueryExecutionCommandOutput;
+    try {
+       queryExecution = await db.startQueryExecution({
+        QueryString: query,
+        WorkGroup: this.credentials.workgroup,
+        ResultConfiguration: {
+          OutputLocation: this.credentials.outputLocation,
+          },
+        });
+    } catch (error) {
+      this.sendErrorDiagnostics(query, error.message);
+      throw error;
+    }
 
     let queryCheckExecution: GetQueryExecutionCommandOutput;
 
@@ -264,18 +271,40 @@ export default class AthenaDriver
           )} scanned`
       );
       await this.sleep(200);
-    } while (!endStatus.has(queryCheckExecution.QueryExecution.Status.State));
+    } while (!this.endStatus.has(queryCheckExecution.QueryExecution.Status.State));
 
     if (queryCheckExecution.QueryExecution.Status.State === QueryExecutionState.FAILED) {
       const errorMessage = queryCheckExecution.QueryExecution.Status.StateChangeReason || '';
-      const diagnostics = this.parseError(errorMessage);
-      console.error('Parsed error diagnostics:', { "diagnostics": diagnostics });
+      this.sendErrorDiagnostics(query, errorMessage);
       throw new Error(errorMessage);
     }
-
     return queryCheckExecution;
   }
-
+  /**
+   * Sends error diagnostics to the editor for the best matching SQL document, we have to do this
+   * because we are not aware which document the error belongs to. SQLTools doesn't pass the context
+   * of the query that caused the error.
+   * @param query The SQL query that caused the error
+   * @param errorMessage The error message from Athena
+   */
+  private sendErrorDiagnostics(query: string, errorMessage: string) {
+    const diagnostics = this.parseError(errorMessage);
+    
+    const server = ServerStorage.getServer();
+    if (server) {
+      const activeDocuments = server.docManager.all();
+      const sqlDocuments = activeDocuments.filter(doc => doc.languageId === 'sql');
+      
+      const bestMatch = this.findBestMatchingDocument(query, sqlDocuments);
+      if (bestMatch) {
+        server.server.sendDiagnostics({
+          uri: bestMatch.uri.toString(), // Convert Uri to string
+          diagnostics
+        });
+      }
+    }
+  }
+  
   private parseError(errorMessage: string): Diagnostic[] {
     const pattern = /line (\d+):(\d+)/;
     const match = errorMessage.match(pattern);
@@ -696,5 +725,17 @@ export default class AthenaDriver
       pageSize: opt.limit,
       page: opt.page || 1,
     }];
+  }
+
+  /** Best effort to match the query to one of the active documents in the editor */
+  private findBestMatchingDocument(query: string, documents: TextDocument[]) {
+    const normalizedQuery = query.trim().toLowerCase();
+    const docContents = documents.map(doc => doc.getText().trim().toLowerCase());
+    
+    const bestMatch = findBestMatch(normalizedQuery, docContents);
+    if (bestMatch.bestMatch.rating > 0.5) {  // Minimum similarity threshold
+      return documents[bestMatch.bestMatchIndex];
+    }
+    return null;
   }
 }
