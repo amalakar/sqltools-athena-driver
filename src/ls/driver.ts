@@ -1,126 +1,363 @@
-import AbstractDriver from '@sqltools/base-driver';
-import { IConnectionDriver, MConnectionExplorer, NSDatabase, Arg0, ContextValue } from '@sqltools/types';
-import queries from './queries';
-import { v4 as generateId } from 'uuid';
-import { Athena, AWSError, Credentials, SharedIniFileCredentials } from 'aws-sdk';
-import { PromiseResult } from 'aws-sdk/lib/request';
-import { GetQueryResultsInput, GetQueryResultsOutput } from 'aws-sdk/clients/athena';
+import AbstractDriver from "@sqltools/base-driver";
+import {
+  IConnectionDriver,
+  MConnectionExplorer,
+  NSDatabase,
+  Arg0,
+  ContextValue,
+  IQueryOptions,
+} from "@sqltools/types";
+import queries from "./queries";
+import { v4 as generateId } from "uuid";
+import { Athena, QueryExecutionState, StartQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
+import {
+  GetQueryResultsInput,
+  GetQueryResultsOutput,
+} from "@aws-sdk/client-athena";
+import { AwsCredentialIdentity } from "@aws-sdk/types";
+import { fromIni } from "@aws-sdk/credential-provider-ini";
+import { GetQueryExecutionCommandOutput } from "@aws-sdk/client-athena";
+import { Diagnostic, DiagnosticSeverity, Range, Position } from "vscode-languageserver";
+import { ServerStorage } from './plugin';
+import { findBestMatch } from 'string-similarity';
+import { TextDocument } from "vscode";
 
-export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.ClientConfiguration> implements IConnectionDriver {
-
-  queries = queries
+export default class AthenaDriver
+  extends AbstractDriver<Athena, any>
+  implements IConnectionDriver
+{
+  queries = queries;
 
   /**
    * If you driver depends on node packages, list it below on `deps` prop.
    * It will be installed automatically on first use of your driver.
    */
-  public readonly deps: typeof AbstractDriver.prototype['deps'] = [{
-    type: AbstractDriver.CONSTANTS.DEPENDENCY_PACKAGE,
-    name: 'lodash',
-    // version: 'x.x.x',
-  }];
+  public readonly deps: (typeof AbstractDriver.prototype)["deps"] = [
+    {
+      type: AbstractDriver.CONSTANTS.DEPENDENCY_PACKAGE,
+      name: "lodash",
+      // version: 'x.x.x',
+    },
+  ];
 
-  /** if you need to require your lib in runtime and then
-   * use `this.lib.methodName()` anywhere and vscode will take care of the dependencies
-   * to be installed on a cache folder
-   **/
-  // private get lib() {
-  //   return this.requireDep('node-packge-name') as DriverLib;
-  // }
-  
+  private schema: { 
+    [catalog: string]: { 
+      [schema: string]: { 
+        [table: string]: { 
+          columnName: string, 
+          dataType: string, 
+          isNullable: boolean 
+        }[] 
+      } 
+    } 
+  } = {};
+  private schemaLoaded: Promise<void> | null = null;
 
+  private staticCompletions: { [w: string]: NSDatabase.IStaticCompletion } | null = null;
+  private staticCompletionLoaded: Promise<void> | null = null;
+  private functionDetails: { [w: string]: NSDatabase.IStaticCompletion } = {};
+  private endStatus = new Set<QueryExecutionState>([
+    QueryExecutionState.FAILED,
+    QueryExecutionState.SUCCEEDED,
+    QueryExecutionState.CANCELLED
+  ]);
+
+  private lastDiagnosticUri: string | null = null;  // Track last document with error
+
+  private async loadInformationSchema() {
+    try {
+      this.log.info('About to load schema using information schema query');
+      const query = `
+        SELECT 
+          table_catalog,
+          table_schema,
+          table_name,
+          column_name,
+          data_type,
+          comment,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('information_schema')
+      `;
+      
+      const result = await this.singleQuery(query, {});
+      let columnCount = 0;
+
+      let schema = {}
+      result.results.forEach(row => {
+        if (!schema[row['table_catalog']]) schema[row['table_catalog']] = {};
+        if (!schema[row['table_catalog']][row['table_schema']]) schema[row['table_catalog']][row['table_schema']] = {};
+        if (!schema[row['table_catalog']][row['table_schema']][row['table_name']]) schema[row['table_catalog']][row['table_schema']][row['table_name']] = [];
+        
+        schema[row['table_catalog']][row['table_schema']][row['table_name']].push({
+          columnName: row['column_name'],
+          dataType: row['data_type'],
+          isNullable: row['is_nullable'] === 'YES'
+        });
+        columnCount++;
+
+      });
+      this.schema = schema;
+      this.log.info({ 
+        msg: 'Schema loaded using information schema',
+        catalogs: Object.keys(this.schema),
+        totalColumns: columnCount
+      });
+    } catch (error) {
+      this.log.error('Failed to load schema information:', {error: error});
+    }
+  }
+
+  private async loadStaticCompletions() {
+
+    try {
+      this.log.info('About to load athena functions');
+      const result = await this.singleQuery('SHOW FUNCTIONS', {});
+      result.results.forEach((row: { 
+        functionName: string;
+        argumentTypes: string;
+        returnType: string;
+        description: string;
+        functionType: string;
+        isDeterministic: boolean;
+    }) => {
+      let functionName = row['Function']
+      let argumentTypes = row['Argument Types']
+      let returnType = row['Return Type']
+      let description = row['Description']
+      let functionType = row['Function Type']
+      let isDeterministic = row['Deterministic']
+
+      if (!functionName) return;
+      this.functionDetails[functionName] = {
+        label: functionName,
+        detail: `${functionName}(${argumentTypes}) → ${returnType}`,
+        documentation: { 
+          kind: 'markdown',
+          value: description + `\n\n**Type:** ${functionType}\n**Deterministic:** ${isDeterministic}`
+        }
+        };
+      });
+      this.log.info({
+        msg: 'Athena function details loaded',
+        totalFunctions: Object.keys(this.functionDetails).length
+      });
+    } catch (error) {
+      this.log.error('Failed to load athena functions:', {error: error});
+    }
+
+    // Add SQL keywords (these aren't included in SHOW FUNCTIONS)
+    const keywords: { [w: string]: NSDatabase.IStaticCompletion } = {
+      'SELECT': { label: 'SELECT', detail: 'SELECT keyword', documentation: { kind: 'markdown', value: 'Start a SELECT query' } },
+      'FROM': { label: 'FROM', detail: 'FROM keyword', documentation: { kind: 'markdown', value: 'Specify the table to query from' } },
+      'WHERE': { label: 'WHERE', detail: 'WHERE clause', documentation: { kind: 'markdown', value: 'Filter results' } },
+      'GROUP BY': { label: 'GROUP BY', detail: 'GROUP BY clause', documentation: { kind: 'markdown', value: 'Group results' } },
+      'ORDER BY': { label: 'ORDER BY', detail: 'ORDER BY clause', documentation: { kind: 'markdown', value: 'Sort results' } },
+      'HAVING': { label: 'HAVING', detail: 'HAVING clause', documentation: { kind: 'markdown', value: 'Filter grouped results' } },
+      'LIMIT': { label: 'LIMIT', detail: 'LIMIT clause', documentation: { kind: 'markdown', value: 'Limit number of results' } },
+      'WITH': { label: 'WITH', detail: 'WITH clause', documentation: { kind: 'markdown', value: 'Define named subqueries' } },
+      'UNNEST': { label: 'UNNEST', detail: 'UNNEST operator', documentation: { kind: 'markdown', value: 'Expands an array into a relation' } },
+      'CROSS JOIN UNNEST': { label: 'CROSS JOIN UNNEST', detail: 'CROSS JOIN UNNEST operator', documentation: { kind: 'markdown', value: 'Join with expanded array' } },  
+    };
+
+    this.staticCompletions = { ...this.functionDetails, ...keywords };
+  }
 
   public async open() {
     if (this.connection) {
       return this.connection;
     }
 
-    if (this.credentials.connectionMethod !== 'Profile')
-      var credentials = new Credentials({
+    let credentials: AwsCredentialIdentity;
+    if (this.credentials.connectionMethod !== "Profile") {
+      credentials = {
         accessKeyId: this.credentials.accessKeyId,
         secretAccessKey: this.credentials.secretAccessKey,
         sessionToken: this.credentials.sessionToken,
-      });
-    else
-      var credentials = new SharedIniFileCredentials({ profile: this.credentials.profile });
+      };
+    } else {
+      try {
+        credentials = await fromIni({ profile: this.credentials.profile })();
+      } catch (error) {
+        this.log.error(
+          "Failed to use credentials for profile",
+          this.credentials.profile,
+          error
+        );
+        throw error;
+      }
+    }
+    
+    this.connection = Promise.resolve(
+      new Athena({
+        credentials: credentials,
+        region: this.credentials.region || "us-east-1",
+      })
+    );
 
-    this.connection = Promise.resolve(new Athena({
-      credentials: credentials,
-      region: this.credentials.region || 'us-east-1',
-    }));
+    // Start both schema and completions loading asynchronously
+    this.schemaLoaded = this.loadInformationSchema().finally(() => {
+      this.schemaLoaded = null;
+    });
+
+    this.staticCompletionLoaded = this.loadStaticCompletions().finally(() => {
+      this.staticCompletionLoaded = null;
+    });
 
     return this.connection;
   }
-    private formatBytes = (bytes: number, decimals: number = 2) => {
-      if (!+bytes) return '0 Bytes'
 
-      const k = 1024
-      const dm = decimals < 0 ? 0 : decimals
-      const sizes = ['Bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']
+  /**
+   * Format bytes to a human readable string
+   */
+  private formatBytes = (bytes: number, decimals: number = 2) => {
+    if (!+bytes) return "0 Bytes";
 
-      const i = Math.floor(Math.log(bytes) / Math.log(k))
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = [
+      "Bytes",
+      "KiB",
+      "MiB",
+      "GiB",
+      "TiB",
+      "PiB",
+      "EiB",
+      "ZiB",
+      "YiB",
+    ];
 
-      return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+  };
+
+  public async close() {
+    this.connection = null;
+    this.schema = {};
+    this.staticCompletions = null;
   }
 
-  public async close() { }
+  private sleep = (time: number) =>
+    new Promise((resolve) => setTimeout(() => resolve(true), time));
 
-  private sleep = (time: number) => new Promise((resolve) => setTimeout(() => resolve(true), time));
-
-  private rawQuery = async (query: string) => {
+  private async rawQuery(query: string) {
     const db = await this.open();
-
-    const queryExecution = await db.startQueryExecution({
-      QueryString: query,
-      WorkGroup: this.credentials.workgroup,
-      ResultConfiguration: {
-        OutputLocation: this.credentials.outputLocation
-      }
-    }).promise();
-
-    const endStatus = new Set(['FAILED', 'SUCCEEDED', 'CANCELLED']);
-
-    let queryCheckExecution;
-
-    do {
-        queryCheckExecution = await db.getQueryExecution({ 
-            QueryExecutionId: queryExecution.QueryExecutionId,
-        }).promise();
-        
-        console.log(
-            `Query ${queryExecution.QueryExecutionId} ` +
-            `is ${queryCheckExecution.QueryExecution.Status.State} ` +
-            `${queryCheckExecution.QueryExecution.Statistics?.TotalExecutionTimeInMillis} ms elapsed. ` +
-            `${this.formatBytes(queryCheckExecution.QueryExecution.Statistics?.DataScannedInBytes)} scanned`
-        );
-
-      await this.sleep(200);
-    } while (!endStatus.has(queryCheckExecution.QueryExecution.Status.State))
-
-    if (queryCheckExecution.QueryExecution.Status.State === 'FAILED') {
-      throw new Error(queryCheckExecution.QueryExecution.Status.StateChangeReason)
+    let queryExecution: StartQueryExecutionCommandOutput;
+    try {
+       queryExecution = await db.startQueryExecution({
+        QueryString: query,
+        WorkGroup: this.credentials.workgroup,
+        ResultConfiguration: {
+          OutputLocation: this.credentials.outputLocation,
+          },
+        });
+    } catch (error) {
+      this.sendErrorDiagnostics(query, error.message);
+      throw error;
     }
 
+    let queryCheckExecution: GetQueryExecutionCommandOutput;
+
+    do {
+      queryCheckExecution = await db.getQueryExecution({
+        QueryExecutionId: queryExecution.QueryExecutionId,
+      });
+
+      this.log.info(
+        `Query ${queryExecution.QueryExecutionId} ` +
+          `is ${queryCheckExecution.QueryExecution.Status.State} ` +
+          `${queryCheckExecution.QueryExecution.Statistics?.TotalExecutionTimeInMillis} ms elapsed. ` +
+          `${this.formatBytes(
+            queryCheckExecution.QueryExecution.Statistics?.DataScannedInBytes
+          )} scanned`
+      );
+      await this.sleep(200);
+    } while (!this.endStatus.has(queryCheckExecution.QueryExecution.Status.State));
+
+    if (queryCheckExecution.QueryExecution.Status.State === QueryExecutionState.FAILED) {
+      const errorMessage = queryCheckExecution.QueryExecution.Status.StateChangeReason || '';
+      this.sendErrorDiagnostics(query, errorMessage);
+      throw new Error(errorMessage);
+    }
     return queryCheckExecution;
   }
+  /**
+   * Sends error diagnostics to the editor for the best matching SQL document, we have to do this
+   * because we are not aware which document the error belongs to. SQLTools doesn't pass the context
+   * of the query that caused the error.
+   * @param query The SQL query that caused the error
+   * @param errorMessage The error message from Athena
+   */
+  private sendErrorDiagnostics(query: string, errorMessage: string) {
+    const diagnostics = this.parseError(errorMessage);
+    
+    const server = ServerStorage.getServer();
+    if (server) {
+      const activeDocuments = server.docManager.all();
+      const sqlDocuments = activeDocuments.filter(doc => doc.languageId === 'sql');
+      
+      const bestMatch = this.findBestMatchingDocument(query, sqlDocuments);
+      if (bestMatch) {
+        const uri = bestMatch.uri.toString();
+        this.lastDiagnosticUri = uri;
+        
+        // Set up change listener if not already set
+        server.docManager.onDidChangeContent((change) => {
+          if (change.document.uri === this.lastDiagnosticUri) {
+            server.server.sendDiagnostics({
+              uri: this.lastDiagnosticUri,
+              diagnostics: []  // Clear diagnostics
+            });
+            this.lastDiagnosticUri = null;  // Reset tracked URI
+          }
+        });
 
-  private async getQueryResults(
-    queryExecutionId: string
-  ) {
-    const results: PromiseResult<GetQueryResultsOutput, AWSError>[] = [];
-    let result: PromiseResult<GetQueryResultsOutput, AWSError>;
+        server.server.sendDiagnostics({ uri, diagnostics });
+      }
+    }
+  }
+  
+  private parseError(errorMessage: string): Diagnostic[] {
+    const pattern = /line (\d+):(\d+)/;
+    const match = errorMessage.match(pattern);
+    
+    const ERROR_HIGHLIGHT_LENGTH = 10;  // Number of characters to highlight
+
+    if (match) {
+      const line = parseInt(match[1], 10) - 1;     // Convert to 0-based
+      const column = parseInt(match[2], 10) - 1;
+      
+      return [{
+        severity: DiagnosticSeverity.Error,
+        range: Range.create(
+          Position.create(line, column),
+          Position.create(line, column + ERROR_HIGHLIGHT_LENGTH)
+        ),
+        message: errorMessage,
+        source: 'Athena'
+      }];
+    }
+    
+    // Return empty array if no line:column found
+    return [];
+  }
+  
+  private async getQueryResults(queryExecutionId: string) {
+    const results: GetQueryResultsOutput[] = [];
+    let result: GetQueryResultsOutput;
     let nextToken: string | null = null;
     let db = await this.open();
 
     do {
       const payload: GetQueryResultsInput = {
-        QueryExecutionId: queryExecutionId
+        QueryExecutionId: queryExecutionId,
       };
       if (nextToken) {
         payload.NextToken = nextToken;
         await this.sleep(200);
       }
-      result = await db.getQueryResults(payload).promise();
+      result = await db.getQueryResults(payload);
       nextToken = result?.NextToken;
       results.push(result);
     } while (nextToken);
@@ -128,10 +365,17 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
     return results;
   }
 
-  public query: (typeof AbstractDriver)['prototype']['query'] = async (queries, opt = {}) => {
+  public query: (typeof AbstractDriver)["prototype"]["query"] = async (
+    queries,
+    opt = {}
+  ) => {
     const queryExecution = await this.rawQuery(queries.toString());
-    const results = await this.getQueryResults(queryExecution.QueryExecution?.QueryExecutionId || '');
-    const columns = results[0].ResultSet.ResultSetMetadata.ColumnInfo.map((info) => info.Name);
+    const results = await this.getQueryResults(
+      queryExecution.QueryExecution?.QueryExecutionId || ""
+    );
+    const columns = results[0].ResultSet.ResultSetMetadata.ColumnInfo.map(
+      (info) => info.Name
+    );
     const resultSet = [];
     results.forEach((result, i) => {
       const rows = result.ResultSet.Rows;
@@ -148,63 +392,105 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
       });
     });
 
-    const response: NSDatabase.IResult[] = [{
-      cols: columns,
-      connId: this.getId(),
-      messages: [{ date: new Date(), message: `Query "${queryExecution.QueryExecution?.QueryExecutionId}" ` +
-      `ok with ${resultSet.length} results. ` +
-      `${this.formatBytes(queryExecution?.QueryExecution?.Statistics?.DataScannedInBytes||0)} scanned`}],
-      results: resultSet,
-      query: queries.toString(),
-      requestId: opt.requestId,
-      resultId: generateId(),
-    }];
+    const response: NSDatabase.IResult[] = [
+      {
+        cols: columns,
+        connId: this.getId(),
+        messages: [
+          {
+            date: new Date(),
+            message:
+              `Query "${queryExecution.QueryExecution?.QueryExecutionId}" ` +
+              `ok with ${resultSet.length} results. ` +
+              `${this.formatBytes(
+                queryExecution?.QueryExecution?.Statistics
+                  ?.DataScannedInBytes || 0
+              )} scanned`,
+          },
+        ],
+        results: resultSet,
+        query: queries.toString(),
+        requestId: opt.requestId,
+        resultId: generateId(),
+      },
+    ];
 
     return response;
-  }
+  };
+
+  public singleQuery: (typeof AbstractDriver)["prototype"]["singleQuery"] = async (
+    query: string | String,
+    opt: IQueryOptions = {}
+  ): Promise<NSDatabase.IResult> => {
+    const results = await this.query(query.toString(), opt);
+    return results[0];
+  };
 
   /** if you need a different way to test your connection, you can set it here.
    * Otherwise by default we open and close the connection only
    */
   public async testConnection() {
     await this.open();
-    await this.query('SELECT 1', {});
+    await this.query("SELECT 1", {});
   }
 
   /**
    * This method is a helper to generate the connection explorer tree.
    * it gets the child items based on current item
    */
-  public async getChildrenForItem({ item, parent }: Arg0<IConnectionDriver['getChildrenForItem']>) {
+  public async getChildrenForItem({
+    item,
+    parent,
+  }: Arg0<IConnectionDriver["getChildrenForItem"]>) {
     const db = await this.connection;
 
     switch (item.type) {
       case ContextValue.CONNECTION:
       case ContextValue.CONNECTED_CONNECTION:
         return <MConnectionExplorer.IChildItem[]>[
-          { label: 'Catalogs', type: ContextValue.RESOURCE_GROUP, iconId: 'folder', childType: ContextValue.SCHEMA },
-        ]
+          {
+            label: "Catalogs",
+            type: ContextValue.RESOURCE_GROUP,
+            iconId: "folder",
+            childType: ContextValue.SCHEMA,
+          },
+        ];
       case ContextValue.SCHEMA:
         return <MConnectionExplorer.IChildItem[]>[
-          { label: 'Databases', type: ContextValue.RESOURCE_GROUP, iconId: 'folder', childType: ContextValue.DATABASE },
+          {
+            label: "Databases",
+            type: ContextValue.RESOURCE_GROUP,
+            iconId: "folder",
+            childType: ContextValue.DATABASE,
+          },
         ];
       case ContextValue.DATABASE:
         return <MConnectionExplorer.IChildItem[]>[
-          { label: 'Tables', type: ContextValue.RESOURCE_GROUP, iconId: 'folder', childType: ContextValue.TABLE },
-          { label: 'Views', type: ContextValue.RESOURCE_GROUP, iconId: 'folder', childType: ContextValue.VIEW },
+          {
+            label: "Tables",
+            type: ContextValue.RESOURCE_GROUP,
+            iconId: "folder",
+            childType: ContextValue.TABLE,
+          },
+          {
+            label: "Views",
+            type: ContextValue.RESOURCE_GROUP,
+            iconId: "folder",
+            childType: ContextValue.VIEW,
+          },
         ];
       case ContextValue.TABLE:
       case ContextValue.VIEW:
         const tableMetadata = await db.getTableMetadata({
           CatalogName: item.schema,
           DatabaseName: item.database,
-          TableName: item.label
-        }).promise();
+          TableName: item.label,
+        });
 
         return [
-          ...tableMetadata.TableMetadata.Columns,
-          ...tableMetadata.TableMetadata.PartitionKeys,
-        ].map(column => ({
+          ...(tableMetadata.TableMetadata.Columns || []),
+          ...(tableMetadata.TableMetadata.PartitionKeys || []),
+        ].map((column) => ({
           label: column.Name,
           type: ContextValue.COLUMN,
           dataType: column.Type,
@@ -212,13 +498,13 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
           database: item.database,
           childType: ContextValue.NO_CHILD,
           isNullable: true,
-          iconName: 'column',
+          iconName: "column",
           table: parent,
         }));
       case ContextValue.RESOURCE_GROUP:
         return this.getChildrenForGroup({ item, parent });
     }
-    
+
     return [];
   }
 
@@ -226,71 +512,46 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
    * This method is a helper to generate the connection explorer tree.
    * It gets the child based on child types
    */
-  private async getChildrenForGroup({ parent, item }: Arg0<IConnectionDriver['getChildrenForItem']>) {
-    const db = await this.connection;
-    
+  private async getChildrenForGroup({
+    parent,
+    item,
+  }: Arg0<IConnectionDriver["getChildrenForItem"]>) {
+    if (this.schemaLoaded) {
+      await this.schemaLoaded;
+    }
+
     switch (item.childType) {
       case ContextValue.SCHEMA:
-        const catalogs = await db.listDataCatalogs().promise();
-
-        return catalogs.DataCatalogsSummary.map((catalog) => ({
-          database: '',
-          label: catalog.CatalogName,
+        // Get catalogs (top level)
+        const catalogNames = Object.keys(this.schema);
+        return catalogNames.map((catalogName) => ({
+          database: "",
+          label: catalogName,
           type: item.childType,
-          schema: catalog.CatalogName,
+          schema: catalogName,
           childType: ContextValue.DATABASE,
         }));
+
       case ContextValue.DATABASE:
-        let databaseList = [];          
-        let firstBatch:boolean = true;
-        let nextToken:string|null = null;
-        
-        while (firstBatch == true || nextToken !== null) {
-          firstBatch = false;
-          let listDbRequest = {
-            CatalogName: parent.schema,
-          }
-          if (nextToken !== null) {
-            Object.assign(listDbRequest, {
-              NextToken: nextToken,
-            });
-          }
-          const catalog = await db.listDatabases(listDbRequest).promise();
-          nextToken = 'NextToken' in catalog ? catalog.NextToken : null;
-
-          databaseList = databaseList.concat(
-            catalog.DatabaseList.map((database) => ({
-              database: database.Name,
-              label: database.Name,
-              type: item.childType,
-              schema: parent.schema,
-              childType: ContextValue.TABLE,
-            })));
-        }
-        return databaseList;
-      case ContextValue.TABLE:
-        const tables = await this.rawQuery(`SHOW TABLES IN \`${parent.database}\``);
-        const views = await this.rawQuery(`SHOW VIEWS IN "${parent.database}"`);
-
-        const viewsSet = new Set(views[0].ResultSet.Rows.map((row) => row.Data[0].VarCharValue));
-
-        return tables[0].ResultSet.Rows
-          .filter((row) => !viewsSet.has(row.Data[0].VarCharValue))
-          .map((row) => ({
-            database: parent.database,
-            label: row.Data[0].VarCharValue,
-            type: item.childType,
-            schema: parent.schema,
-            childType: ContextValue.COLUMN,
-          }));
-      case ContextValue.VIEW:
-        const views2 = await this.rawQuery(`SHOW VIEWS IN "${parent.database}"`);
-        
-        return views2[0].ResultSet.Rows.map((row) => ({
-          database: parent.database,
-          label: row.Data[0].VarCharValue,
+        // Get schemas within the catalog
+        const schemas = this.schema[parent.schema] || {};
+        return Object.keys(schemas).map(schemaName => ({
+          database: schemaName,
+          label: schemaName,
           type: item.childType,
-          schema: parent.schema,
+          schema: parent.schema, // catalog
+          childType: ContextValue.TABLE,
+        }));
+
+      case ContextValue.TABLE:
+      case ContextValue.VIEW:
+        // Get tables within the catalog and schema
+        const tables = this.schema[parent.schema]?.[parent.database] || {};
+        return Object.keys(tables).map(tableName => ({
+          database: parent.database, // schema
+          label: tableName,
+          type: item.childType,
+          schema: parent.schema, // catalog
           childType: ContextValue.COLUMN,
         }));
     }
@@ -300,91 +561,194 @@ export default class AthenaDriver extends AbstractDriver<Athena, Athena.Types.Cl
   /**
    * This method is a helper for intellisense and quick picks.
    */
-  public async searchItems(itemType: ContextValue, search: string, _extraParams: any = {}): Promise<NSDatabase.SearchableItem[]> {
+  public async searchItems(
+    itemType: ContextValue,
+    search: string,
+    _extraParams: any = {}
+  ): Promise<NSDatabase.SearchableItem[]> {
+    // Wait for schema if it's still loading
+    if (this.schemaLoaded) {
+      await this.schemaLoaded;
+    }
+
     switch (itemType) {
       case ContextValue.TABLE:
       case ContextValue.VIEW:
-        let j = 0;
-        return [{
-          database: 'fakedb',
-          label: `${search || 'table'}${j++}`,
-          type: itemType,
-          schema: 'fakeschema',
-          childType: ContextValue.COLUMN,
-        },{
-          database: 'fakedb',
-          label: `${search || 'table'}${j++}`,
-          type: itemType,
-          schema: 'fakeschema',
-          childType: ContextValue.COLUMN,
-        },
-        {
-          database: 'fakedb',
-          label: `${search || 'table'}${j++}`,
-          type: itemType,
-          schema: 'fakeschema',
-          childType: ContextValue.COLUMN,
-        }]
-      case ContextValue.COLUMN:
-        let i = 0;
-        return [
-          {
-            database: 'fakedb',
-            label: `${search || 'porra'}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: 'faketype',
-            schema: 'fakeschema',
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: 'column',
-            table: 'fakeTable'
-          },{
-            database: 'fakedb',
-            label: `${search || 'column'}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: 'faketype',
-            schema: 'fakeschema',
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: 'column',
-            table: 'fakeTable'
-          },{
-            database: 'fakedb',
-            label: `${search || 'column'}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: 'faketype',
-            schema: 'fakeschema',
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: 'column',
-            table: 'fakeTable'
-          },{
-            database: 'fakedb',
-            label: `${search || 'column'}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: 'faketype',
-            schema: 'fakeschema',
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: 'column',
-            table: 'fakeTable'
-          },{
-            database: 'fakedb',
-            label: `${search || 'column'}${i++}`,
-            type: ContextValue.COLUMN,
-            dataType: 'faketype',
-            schema: 'fakeschema',
-            childType: ContextValue.NO_CHILD,
-            isNullable: false,
-            iconName: 'column',
-            table: 'fakeTable'
+        const matchingTables: NSDatabase.SearchableItem[] = [];
+        
+        for (const [catalogName, schemas] of Object.entries(this.schema)) {
+          for (const [schemaName, tables] of Object.entries(schemas)) {
+            for (const tableName of Object.keys(tables)) {
+              if (!search || tableName.toLowerCase().includes(search.toLowerCase())) {
+                matchingTables.push({
+                  database: schemaName,
+                  label: tableName,
+                  type: itemType,
+                  schema: catalogName,
+                  childType: ContextValue.COLUMN,
+                });
+              }
+            }
           }
-        ];
+        }
+
+        return matchingTables.slice(0, 10);
+
+      case ContextValue.COLUMN:
+        const matchingColumns: NSDatabase.SearchableItem[] = [];
+        
+        for (const [catalogName, schemas] of Object.entries(this.schema)) {
+          for (const [schemaName, tables] of Object.entries(schemas)) {
+            for (const [tableName, columns] of Object.entries(tables)) {
+              Object.values(columns).forEach(column => {
+                if (!search || column.columnName.toLowerCase().includes(search.toLowerCase())) {
+                  matchingColumns.push({
+                    database: schemaName,
+                    label: column.columnName,
+                    type: ContextValue.COLUMN,
+                    dataType: column.dataType,
+                    schema: catalogName,
+                    childType: ContextValue.NO_CHILD,
+                    isNullable: column.isNullable,
+                    iconName: "column",
+                    table: tableName,
+                  });
+                }
+              });
+            }
+          }
+        }
+        case ContextValue.FUNCTION:
+          // Wait for completions if they're still loading
+          if (this.staticCompletionLoaded) {
+            await this.staticCompletionLoaded;
+          }
+
+          const matchingFunctions = Object.entries(this.functionDetails)
+            .filter(([name]) => 
+              !search || name.toLowerCase().includes(search.toLowerCase()))
+            .map(([name, completion]) => ({
+              label: name,
+              type: ContextValue.FUNCTION,
+              schema: '',
+              database: '',
+              childType: ContextValue.NO_CHILD,
+              detail: completion.detail,
+            }))
+            .slice(0, 10);
+
+          return matchingFunctions;
     }
     return [];
   }
 
-  public getStaticCompletions: IConnectionDriver['getStaticCompletions'] = async () => {
-    return {};
+  /**
+   * Use Athena's SHOW FUNCTIONS to get completions for SQL functions
+   */
+  public async getStaticCompletions(): Promise<{ [w: string]: NSDatabase.IStaticCompletion }> {
+    // Wait for completions if they're still loading
+    if (this.staticCompletionLoaded) {
+      await this.staticCompletionLoaded;
+    }
+    
+    return this.staticCompletions || {};
+  }
+
+  public async describeTable(
+    table: NSDatabase.ITable,
+    opt?: IQueryOptions
+  ): Promise<NSDatabase.IResult[]> {
+    const db = await this.open();
+    
+    const tableMetadata = await db.getTableMetadata({
+      CatalogName: table.schema,
+      DatabaseName: table.database,
+      TableName: table.label,
+    });
+
+    const columns = [
+      ...(tableMetadata.TableMetadata.Columns || []),
+      ...(tableMetadata.TableMetadata.PartitionKeys || [])
+    ].map(col => ({
+      column_name: col.Name,
+      data_type: col.Type,
+      is_nullable: 'YES',
+      column_key: col.Name in (tableMetadata.TableMetadata.PartitionKeys || []) ? 'PARTITION KEY' : '',
+    }));
+
+    return [{
+      resultId: generateId(),
+      connId: this.getId(),
+      cols: ['column_name', 'data_type', 'is_nullable', 'column_key'],
+      messages: [{ message: `Described table ${table.label}`, date: new Date() }],
+      query: `DESCRIBE \`${table.database}\`.\`${table.label}\``,
+      results: columns,
+      requestId: opt?.requestId,
+    }];
+  }
+  
+  public async showRecords(
+    table: NSDatabase.ITable,
+    opt: IQueryOptions & { limit: number; page?: number }
+  ): Promise<NSDatabase.IResult[]> {
+    const offset = opt.page ? (opt.page - 1) * opt.limit : 0;
+    const query = `SELECT *
+      FROM "${table.database}"."${table.label}"
+      LIMIT ${opt.limit}
+      ${offset > 0 ? `OFFSET ${offset}` : ''}`;
+
+    const queryExecution = await this.rawQuery(query);
+    const results = await this.getQueryResults(
+      queryExecution.QueryExecution?.QueryExecutionId || ''
+    );
+
+    // Get column names from the first result's metadata
+    const columns = results[0].ResultSet.ResultSetMetadata.ColumnInfo.map(
+      (info) => info.Name
+    );
+
+    // Transform the results into the expected format
+    const resultSet = [];
+    results.forEach((result, i) => {
+      const rows = result.ResultSet.Rows;
+      if (i === 0) rows.shift(); // Skip header row in first result
+      rows.forEach(({ Data }) => {
+        resultSet.push(
+          Object.assign(
+            {},
+            ...Data.map((column, i) => ({ [columns[i]]: column.VarCharValue }))
+          )
+        );
+      });
+    });
+
+    return [{
+      resultId: generateId(),
+      connId: this.getId(),
+      cols: columns,
+      messages: [{
+        date: new Date(),
+        message: `Retrieved ${resultSet.length} records from ${table.label}. ${this.formatBytes(
+          queryExecution.QueryExecution?.Statistics?.DataScannedInBytes || 0
+        )} scanned`,
+      }],
+      results: resultSet,
+      query: query,
+      requestId: opt.requestId,
+      pageSize: opt.limit,
+      page: opt.page || 1,
+    }];
+  }
+
+  /** Best effort to match the query to one of the active documents in the editor */
+  private findBestMatchingDocument(query: string, documents: TextDocument[]) {
+    const normalizedQuery = query.trim().toLowerCase();
+    const docContents = documents.map(doc => doc.getText().trim().toLowerCase());
+    
+    const bestMatch = findBestMatch(normalizedQuery, docContents);
+    if (bestMatch.bestMatch.rating > 0.5) {  // Minimum similarity threshold
+      return documents[bestMatch.bestMatchIndex];
+    }
+    return null;
   }
 }
